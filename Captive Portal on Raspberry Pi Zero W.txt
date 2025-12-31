@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+import subprocess
+import threading
+import time
+import os
+import sys
+import json
+import hashlib
+import re
+from cryptography.fernet import Fernet
+from flask import Flask, render_template_string, request, redirect, make_response
+import logging
+import base64
+
+# GPIO imports
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("Warning: RPi.GPIO not available. Button functionality disabled.")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Configuration - Optimized timing
+INTERNET_CHECK_INTERVAL = 5      # seconds
+NO_INTERNET_TIMEOUT = 7          # seconds to wait before starting AP
+CONNECTION_TIMEOUT = 15          # seconds
+SAVED_NETWORK_RETRY = 10         # seconds
+AP_SSID = "MyPi-Config"          # Access Point name
+
+# GPIO Configuration
+BUTTON_PIN = 18
+BUTTON_HOLD_TIME = 3
+BUTTON_DEBOUNCE_TIME = 0.05
+
+# Security Configuration
+CREDENTIALS_FILE = "/etc/mypi/saved_networks.json"
+ENCRYPTION_KEY_FILE = "/etc/mypi/network.key"
+TEMP_CLEANUP_TIME = 10
+
+# -------------- HTML (unchanged UI) --------------
+WIFI_SETUP_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WiFi Configuration</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#667eea;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:15px}
+.container{background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.1);padding:30px;width:100%;max-width:500px}
+h1{color:#2d3748;text-align:center;margin-bottom:25px;font-size:1.8rem;font-weight:600}
+.status{text-align:center;margin-bottom:20px;padding:12px;border-radius:8px;background:#e3f2fd;color:#1565c0;font-weight:500}
+.saved-networks{margin-bottom:20px;padding:15px;background:#f0f8f0;border-radius:8px;border:1px solid #c8e6c9}
+.saved-network-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #e0e0e0}
+.saved-network-item:last-child{border-bottom:none}
+.quick-connect-btn{background:#4caf50;color:white;border:none;padding:6px 12px;border-radius:4px;font-size:.85rem;cursor:pointer}
+.refresh-btn{background:#2196f3;color:white;border:none;padding:8px 16px;border-radius:6px;font-size:.9rem;cursor:pointer;margin-bottom:15px}
+.network-list{max-height:250px;overflow-y:auto;border:1px solid #e0e0e0;border-radius:8px;background:white;margin-bottom:15px}
+.network-item{padding:12px;cursor:pointer;border-bottom:1px solid #f0f0f0;transition:background-color .2s}
+.network-item:hover{background:#f5f5f5}
+.network-item.selected{background:#e3f2fd;border-left:3px solid #2196f3}
+.network-name{font-weight:600;color:#333;margin-bottom:4px}
+.network-details{display:flex;gap:15px;font-size:.8rem;color:#666}
+.signal-strength{display:flex;align-items:center;gap:4px}
+.signal-bars{display:flex;gap:1px;height:10px}
+.signal-bar{width:3px;background:#ddd;border-radius:1px}
+.signal-bar.bar-1{height:3px}
+.signal-bar.bar-2{height:6px}
+.signal-bar.bar-3{height:10px}
+.signal-excellent .signal-bar{background:#4caf50}
+.signal-good .signal-bar:nth-child(-n+2){background:#8bc34a}
+.signal-fair .signal-bar:nth-child(1){background:#ff9800}
+.signal-weak .signal-bar:nth-child(1){background:#f44336}
+.security-tag{padding:2px 6px;border-radius:3px;font-size:.7rem;font-weight:500}
+.security-open{background:#ffebee;color:#c62828}
+.security-wpa{background:#e8f5e8;color:#2e7d32}
+input[type=password]{width:100%;padding:12px;border:1px solid #ddd;border-radius:6px;font-size:1rem;margin-bottom:15px;outline:none}
+input[type=password]:focus{border-color:#2196f3;box-shadow:0 0 0 2px rgba(33,150,243,.2)}
+.save-options{background:#f9f9f9;padding:15px;border-radius:6px;margin-bottom:15px}
+.save-options h4{margin-bottom:10px;color:#333}
+.radio-option{display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer}
+.radio-option input[type=radio]{width:16px;height:16px;margin:0}
+button{width:100%;background:#2196f3;color:white;border:none;padding:12px;border-radius:6px;font-size:1rem;font-weight:600;cursor:pointer}
+button:hover{background:#1976d2}
+button:disabled{opacity:.6;cursor:not-allowed}
+.message{margin-top:15px;padding:12px;border-radius:6px;font-weight:500;text-align:center}
+.message.success{background:#e8f5e8;color:#2e7d32;border:1px solid #4caf50}
+.message.error{background:#ffebee;color:#c62828;border:1px solid #f44336}
+@media (max-width:480px){.container{padding:20px 15px;margin:10px}h1{font-size:1.5rem}.network-details{flex-direction:column;gap:5px}}
+</style>
+<script>
+let selectedNetwork=null;
+function selectNetwork(ssid,el){document.querySelectorAll('.network-item').forEach(i=>i.classList.remove('selected'));el.classList.add('selected');selectedNetwork=ssid;document.getElementById('selected_ssid').value=ssid;document.getElementById('submitBtn').disabled=false;document.getElementById('password').focus();}
+async function refreshNetworks(){const b=document.querySelector('.refresh-btn');b.disabled=true;b.textContent='Scanning...';try{const r=await fetch('/scan_networks');const d=await r.json();const list=document.querySelector('.network-list');list.innerHTML='';d.networks.forEach(n=>{list.appendChild(createNetworkItem(n));});}catch(e){console.error('Scan failed:',e);}finally{b.disabled=false;b.textContent='Refresh Networks';}}
+function createNetworkItem(n){const d=document.createElement('div');d.className='network-item';d.onclick=()=>selectNetwork(n.ssid,d);d.innerHTML=`<div class="network-name">${n.ssid}</div>
+<div class="network-details">
+  <div class="signal-strength">
+    <div class="signal-bars ${n.signal_class}">
+      <div class="signal-bar bar-1"></div>
+      <div class="signal-bar bar-2"></div>
+      <div class="signal-bar bar-3"></div>
+    </div>
+    <span>${n.signal_strength}%</span>
+  </div>
+  <div class="security-tag security-${n.security_type}">${n.security}</div>
+  <div>${n.frequency}</div>
+</div>`;return d;}
+document.addEventListener('DOMContentLoaded',function(){const items=document.querySelectorAll('.network-item');if(items.length===1){items[0].click();}});
+</script>
+</head>
+<body>
+<div class="container">
+<h1>WiFi Configuration</h1>
+<div class="status">No internet connection. Configure WiFi to get online.</div>
+{% if saved_networks %}
+<div class="saved-networks">
+  <h3 style="margin-bottom:10px;color:#333;">Saved Networks</h3>
+  {% for network in saved_networks %}
+  <div class="saved-network-item">
+    <span>{{ network }}</span>
+    <form method="POST" action="/quick_connect" style="margin:0;">
+      <input type="hidden" name="ssid" value="{{ network }}">
+      <button type="submit" class="quick-connect-btn">Connect</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+<button class="refresh-btn" onclick="refreshNetworks()">Refresh Networks</button>
+<form method="POST" action="/setup" id="wifiForm">
+  <input type="hidden" id="selected_ssid" name="ssid" value="">
+  <div class="network-list">
+    {% for network in networks %}
+    <div class="network-item" onclick="selectNetwork('{{ network.ssid }}', this)">
+      <div class="network-name">{{ network.ssid }}</div>
+      <div class="network-details">
+        <div class="signal-strength">
+          <div class="signal-bars {{ network.signal_class }}">
+            <div class="signal-bar bar-1"></div>
+            <div class="signal-bar bar-2"></div>
+            <div class="signal-bar bar-3"></div>
+          </div>
+          <span>{{ network.signal_strength }}%</span>
+        </div>
+        <div class="security-tag security-{{ network.security_type }}">{{ network.security }}</div>
+        <div>{{ network.frequency }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  <input type="password" name="password" id="password" placeholder="Enter WiFi password" required />
+  <div class="save-options">
+    <h4>Save Credentials</h4>
+    <div class="radio-option"><input type="radio" id="save_encrypted" name="save_option" value="save_encrypted" checked><label for="save_encrypted">Save for future use</label></div>
+    <div class="radio-option"><input type="radio" id="no_save" name="save_option" value="no_save"><label for="no_save">Don't save</label></div>
+  </div>
+  <button type="submit" id="submitBtn" disabled>Connect to WiFi</button>
+</form>
+{% if message %}<div class="message {{ message_type }}">{{ message|safe }}</div>{% endif %}
+</div>
+</body>
+</html>
+"""
+
+CAPTIVE_PORTAL_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network Setup</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#667eea;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.container{background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.1);padding:40px;width:100%;max-width:400px;text-align:center}
+.icon{font-size:3rem;margin-bottom:20px}
+h1{color:#2d3748;margin-bottom:20px;font-size:1.8rem;font-weight:600}
+p{color:#4a5568;margin-bottom:30px;font-size:1rem;line-height:1.5}
+.setup-btn{background:#2196f3;color:white;border:none;padding:12px 30px;border-radius:6px;font-size:1rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}
+.setup-btn:hover{background:#1976d2}
+.device-info{margin-top:25px;padding:15px;background:#f5f5f5;border-radius:6px;color:#666;font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="icon">📶</div>
+  <h1>Network Setup Required</h1>
+  <p>Connect this device to the internet by configuring WiFi settings.</p>
+  <a href="/setup" class="setup-btn">Setup WiFi Connection</a>
+  <div class="device-info">
+    <strong>Device:</strong> {{ AP_SSID }}<br>
+    <strong>Status:</strong> Waiting for configuration<br>
+    <strong>Network:</strong> Open (no password required)
+  </div>
+</div>
+</body>
+</html>
+"""
+
+# -------------- Button Controller --------------
+class ButtonController:
+    def __init__(self, callback=None):
+        self.button_pressed = False
+        self.button_hold_start = None
+        self.callback = callback
+        self.monitoring = True
+        if GPIO_AVAILABLE:
+            self.setup_gpio()
+            self.start_monitoring()
+        else:
+            logger.warning("GPIO not available - button functionality disabled")
+
+    def setup_gpio(self):
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            logger.info(f"GPIO button configured on pin {BUTTON_PIN}")
+        except Exception as e:
+            logger.error(f"GPIO setup failed: {e}")
+            self.monitoring = False
+
+    def start_monitoring(self):
+        if not self.monitoring:
+            return
+        threading.Thread(target=self._monitor_button, daemon=True).start()
+        logger.info("Button monitoring started")
+
+    def _monitor_button(self):
+        while self.monitoring:
+            try:
+                button_state = GPIO.input(BUTTON_PIN)
+                if button_state == GPIO.LOW:  # pressed
+                    if not self.button_pressed:
+                        self.button_pressed = True
+                        self.button_hold_start = time.time()
+                        logger.info("Configuration button pressed...")
+                    else:
+                        if time.time() - self.button_hold_start >= BUTTON_HOLD_TIME:
+                            logger.info("Button held long enough - activating configuration mode")
+                            if self.callback:
+                                self.callback()
+                            self.button_pressed = False
+                            self.button_hold_start = None
+                            time.sleep(1)
+                else:
+                    if self.button_pressed:
+                        self.button_pressed = False
+                        self.button_hold_start = None
+                time.sleep(BUTTON_DEBOUNCE_TIME)
+            except Exception as e:
+                logger.error(f"Button monitoring error: {e}")
+                time.sleep(1)
+
+    def cleanup(self):
+        self.monitoring = False
+        if GPIO_AVAILABLE:
+            try:
+                GPIO.cleanup()
+                logger.info("GPIO cleanup completed")
+            except:
+                pass
+
+# -------------- Credential Manager --------------
+class CredentialManager:
+    def __init__(self):
+        self.ensure_directories()
+        self.temp_credentials = {}
+
+    def ensure_directories(self):
+        os.makedirs("/etc/mypi", exist_ok=True)
+
+    def get_encryption_key(self):
+        if os.path.exists(ENCRYPTION_KEY_FILE):
+            with open(ENCRYPTION_KEY_FILE, 'rb') as f:
+                return f.read()
+        key = Fernet.generate_key()
+        with open(ENCRYPTION_KEY_FILE, 'wb') as f:
+            f.write(key)
+        os.chmod(ENCRYPTION_KEY_FILE, 0o600)
+        return key
+
+    def encrypt_password(self, password):
+        key = self.get_encryption_key()
+        f = Fernet(key)
+        return f.encrypt(password.encode()).decode()
+
+    def decrypt_password(self, encrypted_password):
+        try:
+            key = self.get_encryption_key()
+            f = Fernet(key)
+            return f.decrypt(encrypted_password.encode()).decode()
+        except Exception as e:
+            logger.error(f"Failed to decrypt password: {e}")
+            return None
+
+    def save_credentials(self, ssid, password, save_option="save_encrypted"):
+        logger.info(f"Saving credentials for {ssid} with option: {save_option}")
+        if save_option == "no_save":
+            logger.info("Not saving credentials (user choice)")
+            return
+        if save_option == "save_encrypted":
+            saved_networks = self.load_saved_networks()
+            encrypted_password = self.encrypt_password(password)
+            saved_networks[ssid] = {'encrypted_password': encrypted_password, 'saved_time': time.time()}
+            try:
+                with open(CREDENTIALS_FILE, 'w') as f:
+                    json.dump(saved_networks, f, indent=2)
+                os.chmod(CREDENTIALS_FILE, 0o600)
+                logger.info(f"Encrypted credentials saved for {ssid}")
+            except Exception as e:
+                logger.error(f"Failed to save credentials: {e}")
+
+    def load_saved_networks(self):
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                with open(CREDENTIALS_FILE, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load saved networks: {e}")
+            return {}
+
+    def get_credential(self, ssid):
+        saved_networks = self.load_saved_networks()
+        if ssid in saved_networks:
+            enc = saved_networks[ssid]['encrypted_password']
+            return self.decrypt_password(enc)
+        return None
+
+    def get_saved_network_names(self):
+        saved_networks = self.load_saved_networks()
+        return list(saved_networks.keys())
+
+# -------------- Network Scanner --------------
+class NetworkScanner:
+    def __init__(self):
+        self.last_scan = None
+        self.scan_cache = []
+        self.cache_timeout = 10
+
+    def parse_iwlist_scan(self, scan_output):
+        networks, current = [], {}
+        for line in scan_output.split('\n'):
+            line = line.strip()
+            if 'Cell' in line and 'Address:' in line:
+                if current and 'ssid' in current:
+                    networks.append(current)
+                current = {}
+                m = re.search(r'Address: ([0-9A-Fa-f:]{17})', line)
+                if m:
+                    current['mac'] = m.group(1)
+            elif 'ESSID:' in line:
+                m = re.search(r'ESSID:"([^"]*)"', line)
+                if m:
+                    ssid = m.group(1)
+                    if ssid:
+                        current['ssid'] = ssid
+            elif 'Quality=' in line:
+                qm = re.search(r'Quality=(\d+)/(\d+)', line)
+                if qm:
+                    q, qmax = int(qm.group(1)), int(qm.group(2))
+                    current['quality'] = round((q / qmax) * 100)
+                sm = re.search(r'Signal level=(-?\d+)', line)
+                if sm:
+                    current['signal_dbm'] = int(sm.group(1))
+            elif 'Frequency:' in line:
+                fm = re.search(r'Frequency:([0-9.]+) GHz', line)
+                if fm:
+                    ghz = float(fm.group(1))
+                    current['frequency_ghz'] = ghz
+                    current['frequency'] = f"{ghz} GHz"
+                    current['frequency_band'] = '2g' if ghz < 3.0 else '5g'
+            elif 'Encryption key:' in line:
+                if 'on' in line.lower():
+                    current['encrypted'] = True
+                else:
+                    current['encrypted'] = False
+                    current['security'] = 'Open'
+                    current['security_type'] = 'open'
+            elif any(p in line for p in ['WPA', 'WPA2', 'WPA3']):
+                if 'WPA3' in line:
+                    current['security'] = 'WPA3'; current['security_type'] = 'wpa'
+                elif 'WPA2' in line:
+                    current['security'] = 'WPA2'; current['security_type'] = 'wpa'
+                elif 'WPA' in line:
+                    current['security'] = 'WPA'; current['security_type'] = 'wpa'
+        if current and 'ssid' in current:
+            networks.append(current)
+        return networks
+
+    def calculate_signal_strength_percentage(self, dbm):
+        if dbm >= -30: return 100
+        if dbm <= -90: return 0
+        return round(((dbm + 90) / 60) * 100)
+
+    def get_signal_class(self, pct):
+        if pct >= 75: return 'signal-excellent'
+        if pct >= 50: return 'signal-good'
+        if pct >= 25: return 'signal-fair'
+        return 'signal-weak'
+
+    def process_network_data(self, networks):
+        out = []
+        for n in networks:
+            if 'ssid' not in n or 'signal_dbm' not in n: continue
+            pct = self.calculate_signal_strength_percentage(n.get('signal_dbm', -90))
+            n['signal_strength'] = pct
+            n['signal_class'] = self.get_signal_class(pct)
+            n.setdefault('quality', max(0, min(100, pct)))
+            n.setdefault('frequency', '2.4 GHz')
+            n.setdefault('frequency_band', '2g')
+            if 'security' not in n:
+                if n.get('encrypted', True):
+                    n['security'] = 'WPA/WPA2'; n['security_type'] = 'wpa'
+                else:
+                    n['security'] = 'Open'; n['security_type'] = 'open'
+            n['signal_dbm'] = f"{n.get('signal_dbm', -90)}"
+            out.append(n)
+        out.sort(key=lambda x: x['signal_strength'], reverse=True)
+        return out
+
+    def scan_networks(self, force_refresh=False):
+        now = time.time()
+        if not force_refresh and self.last_scan and now - self.last_scan < self.cache_timeout:
+            logger.info(f"Using cached network scan ({len(self.scan_cache)} networks)")
+            return self.scan_cache
+        logger.info("Scanning for WiFi networks...")
+        try:
+            scan_output = subprocess.check_output(["sudo", "iwlist", "wlan0", "scan"],
+                                                  timeout=10, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore')
+            nets = self.process_network_data(self.parse_iwlist_scan(scan_output))
+            self.scan_cache, self.last_scan = nets, now
+            logger.info(f"Found {len(nets)} networks")
+            return nets
+        except subprocess.TimeoutExpired:
+            logger.error("Network scan timed out"); return []
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Network scan failed: {e}"); return []
+        except Exception as e:
+            logger.error(f"Unexpected error during network scan: {e}"); return []
+
+# -------------- Internet Monitor --------------
+class InternetMonitor:
+    def __init__(self):
+        self.has_internet = False
+        self.no_internet_start_time = None
+        self.ap_active = False
+        self.monitoring = True
+        self.manual_activation = False
+
+    # ---- NEW: single place to flush rules ----
+    def flush_iptables(self):
+        """Clear captive-portal NAT/Filter rules (idempotent & safe)."""
+        try:
+            subprocess.run(["sudo", "iptables", "-t", "nat", "-F"], check=False)
+            subprocess.run(["sudo", "iptables", "-F"], check=False)
+            logger.info("iptables rules flushed")
+        except Exception as e:
+            logger.warning(f"Failed to flush iptables: {e}")
+
+    def test_connection(self):
+        try:
+            for host in ["8.8.8.8", "1.1.1.1", "208.67.222.222"]:
+                r = subprocess.run(["ping", "-c", "1", "-W", "2", host],
+                                   check=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=3)
+                if r.returncode == 0:
+                    return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+        return False
+
+    def try_saved_networks(self):
+        names = credential_manager.get_saved_network_names()
+        if not names:
+            logger.info("No saved networks found")
+            return False
+        logger.info(f"Attempting {len(names)} saved networks...")
+        for ssid in names:
+            pwd = credential_manager.get_credential(ssid)
+            if not pwd:
+                logger.warning(f"Could not decrypt password for {ssid}")
+                continue
+            logger.info(f"Trying saved network: {ssid}")
+            if connect_to_wifi(ssid, pwd):
+                time.sleep(5)
+                if self.test_connection():
+                    logger.info(f"Successfully connected to saved network: {ssid}")
+                    return True
+                logger.warning(f"Connected to {ssid} but no internet access")
+        logger.info("All saved networks failed or no internet access")
+        return False
+
+    def start_access_point(self, manual=False):
+        if self.ap_active:
+            return
+        self.manual_activation = manual
+        reason = "manual button press" if manual else "no internet connection"
+        logger.info(f"Starting access point due to: {reason}")
+        try:
+            subprocess.run(["sudo", "pkill", "-f", "wpa_supplicant"], check=False)
+            subprocess.run(["sudo", "pkill", "-f", "dhclient"], check=False)
+            time.sleep(2)
+
+            hostapd_config = f"""interface=wlan0
+driver=nl80211
+ssid={AP_SSID}
+hw_mode=g
+channel=7
+wmm_enabled=0
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+"""
+            with open("/tmp/hostapd.conf", "w") as f: f.write(hostapd_config)
+            subprocess.run(["sudo", "cp", "/tmp/hostapd.conf", "/etc/hostapd/hostapd.conf"], check=True)
+
+            dnsmasq_config = """interface=wlan0
+dhcp-range=10.10.0.2,10.10.0.20,255.255.255.0,24h
+dhcp-option=3,10.10.0.1
+dhcp-option=6,10.10.0.1
+address=/#/10.10.0.1
+no-hosts
+no-resolv
+log-queries
+"""
+            with open("/tmp/dnsmasq.conf", "w") as f: f.write(dnsmasq_config)
+            subprocess.run(["sudo", "cp", "/tmp/dnsmasq.conf", "/etc/dnsmasq.conf"], check=True)
+
+            subprocess.run(["sudo", "ifconfig", "wlan0", "down"], check=False)
+            time.sleep(2)
+            subprocess.run(["sudo", "ifconfig", "wlan0", "up"], check=False)
+            subprocess.run(["sudo", "ifconfig", "wlan0", "10.10.0.1"], check=True)
+
+            subprocess.run(["sudo", "systemctl", "restart", "dnsmasq"], check=True)
+            subprocess.run(["sudo", "systemctl", "restart", "hostapd"], check=True)
+
+            self.setup_captive_portal_rules()
+            self.ap_active = True
+            logger.info(f"Access point '{AP_SSID}' started successfully (open network)")
+        except Exception as e:
+            logger.error(f"Failed to start access point: {e}")
+
+    def stop_access_point(self):
+        if not self.ap_active:
+            return
+        logger.info("Stopping access point...")
+        try:
+            subprocess.run(["sudo", "systemctl", "stop", "hostapd"], check=False)
+            subprocess.run(["sudo", "systemctl", "stop", "dnsmasq"], check=False)
+            # Use the helper for consistency
+            self.flush_iptables()
+            self.ap_active = False
+            self.manual_activation = False
+            logger.info("Access point stopped")
+        except Exception as e:
+            logger.error(f"Failed to stop access point: {e}")
+
+    def setup_captive_portal_rules(self):
+        """Setup iptables rules for captive portal redirection"""
+        # start from a clean state (avoids duplicate rules)
+        self.flush_iptables()
+        commands = [
+            "sudo iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 80  -j DNAT --to-destination 10.10.0.1:5000",
+            "sudo iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 443 -j DNAT --to-destination 10.10.0.1:5000",
+            "sudo iptables -A FORWARD -i wlan0 -j ACCEPT",
+            "sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
+        ]
+        for cmd in commands:
+            try:
+                subprocess.run(cmd.split(), check=False)
+            except Exception as e:
+                logger.warning(f"iptables command failed: {cmd} - {e}")
+
+    def handle_button_activation(self):
+        logger.info("Manual configuration activated via button")
+        self.start_access_point(manual=True)
+
+    def monitor_connection(self):
+        logger.info("Starting internet connection monitor...")
+        logger.info("Boot sequence: checking for saved networks...")
+        if self.try_saved_networks():
+            self.has_internet = True
+            logger.info("Connected to saved network on boot")
+        else:
+            logger.info("No saved networks available or connection failed")
+            self.has_internet = False
+            self.no_internet_start_time = time.time()
+
+        while self.monitoring:
+            current_status = self.test_connection()
+            if current_status != self.has_internet:
+                if current_status:
+                    logger.info("Internet connection restored!")
+                    self.has_internet = True
+                    self.no_internet_start_time = None
+                    # ---- NEW: proactively clear any leftover redirect rules ----
+                    self.flush_iptables()
+                    # Only stop AP if not manually activated
+                    if self.ap_active and not self.manual_activation:
+                        self.stop_access_point()
+                else:
+                    logger.warning("Internet connection lost!")
+                    self.has_internet = False
+                    self.no_internet_start_time = time.time()
+
+            # Start AP after grace period (unless manual AP already active)
+            if not self.has_internet and not self.ap_active and not self.manual_activation:
+                if self.no_internet_start_time:
+                    offline = time.time() - self.no_internet_start_time
+                    if offline >= NO_INTERNET_TIMEOUT:
+                        logger.info(f"No internet for {offline:.0f}s - starting access point")
+                        self.start_access_point()
+                    else:
+                        remaining = NO_INTERNET_TIMEOUT - offline
+                        logger.info(f"No internet for {offline:.0f}s - AP starts in {remaining:.0f}s")
+
+            time.sleep(INTERNET_CHECK_INTERVAL)
+
+# -------------- WiFi Connect --------------
+def connect_to_wifi(ssid, password):
+    """Connect to WiFi network with timeout"""
+    wpa_config = f"""ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+country=IN
+
+network={{
+    ssid="{ssid}"
+    psk="{password}"
+    key_mgmt=WPA-PSK
+}}
+"""
+    try:
+        logger.info(f"Attempting to connect to {ssid}...")
+        tmp_file = "/tmp/wpa_supplicant.conf"
+        with open(tmp_file, "w") as f:
+            f.write(wpa_config)
+        subprocess.run(["sudo", "cp", tmp_file, "/etc/wpa_supplicant/wpa_supplicant.conf"], check=True)
+
+        if monitor.ap_active:
+            monitor.stop_access_point()
+
+        subprocess.run(["sudo", "pkill", "-f", "dhclient"], check=False)
+        subprocess.run(["sudo", "pkill", "-f", "wpa_supplicant"], check=False)
+        time.sleep(2)
+
+        subprocess.run(["sudo", "ifconfig", "wlan0", "down"], check=False)
+        time.sleep(1)
+        subprocess.run(["sudo", "ifconfig", "wlan0", "up"], check=False)
+        time.sleep(2)
+
+        subprocess.run(["sudo", "wpa_supplicant", "-B", "-i", "wlan0", "-c", "/etc/wpa_supplicant/wpa_supplicant.conf"],
+                       check=True, timeout=10)
+        time.sleep(5)
+
+        subprocess.run(["sudo", "dhclient", "wlan0"], check=True, timeout=CONNECTION_TIMEOUT)
+        time.sleep(3)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error(f"Connection to {ssid} timed out"); return False
+    except Exception as e:
+        logger.error(f"Connection failed: {e}"); return False
+
+# -------------- Globals --------------
+monitor = InternetMonitor()
+credential_manager = CredentialManager()
+network_scanner = NetworkScanner()
+button_controller = None
+
+# -------------- Flask Routes --------------
+@app.route("/")
+def index():
+    return render_template_string(CAPTIVE_PORTAL_HTML, AP_SSID=AP_SSID)
+
+@app.route("/setup")
+def setup_page():
+    networks = network_scanner.scan_networks()
+    saved_networks = credential_manager.get_saved_network_names()
+    return render_template_string(WIFI_SETUP_HTML, networks=networks, saved_networks=saved_networks,
+                                  message="", message_type="")
+
+@app.route("/scan_networks")
+def scan_networks_api():
+    networks = network_scanner.scan_networks(force_refresh=True)
+    return {"networks": networks}
+
+@app.route("/setup", methods=["POST"])
+def handle_setup():
+    networks = network_scanner.scan_networks()
+    saved_networks = credential_manager.get_saved_network_names()
+    message = ""; message_type = ""
+    ssid = request.form.get("ssid"); password = request.form.get("password")
+    save_option = request.form.get("save_option", "save_encrypted")
+
+    if not ssid or not password:
+        return render_template_string(WIFI_SETUP_HTML, networks=networks, saved_networks=saved_networks,
+                                      message="Please provide both SSID and password", message_type="error")
+
+    if connect_to_wifi(ssid, password):
+        if monitor.test_connection():
+            credential_manager.save_credentials(ssid, password, save_option)
+            save_messages = {
+                "save_encrypted": "Credentials saved securely for future use",
+                "no_save": "Connected without saving credentials"
+            }
+            message = (f"Successfully connected to <b>{ssid}</b>! Internet access verified.<br>"
+                       f"{save_messages.get(save_option, '')}<br>Configuration portal will close shortly.")
+            message_type = "success"
+            monitor.has_internet = True
+            monitor.no_internet_start_time = None
+            # ---- NEW: clear redirect rules immediately after success ----
+            monitor.flush_iptables()
+
+            def shutdown_ap():
+                time.sleep(5)
+                if monitor.ap_active:
+                    monitor.stop_access_point()
+            threading.Thread(target=shutdown_ap, daemon=True).start()
+        else:
+            message = f"Connected to <b>{ssid}</b> but no internet access. Please check network settings."
+            message_type = "error"
+    else:
+        message = "Connection failed: Wrong password or network issue"
+        message_type = "error"
+
+    return render_template_string(WIFI_SETUP_HTML, networks=networks, saved_networks=saved_networks,
+                                  message=message, message_type=message_type)
+
+@app.route("/quick_connect", methods=["POST"])
+def handle_quick_connect():
+    networks = network_scanner.scan_networks()
+    saved_networks = credential_manager.get_saved_network_names()
+    ssid = request.form.get("ssid")
+    if not ssid:
+        return redirect("/setup")
+    password = credential_manager.get_credential(ssid)
+    if not password:
+        return render_template_string(WIFI_SETUP_HTML, networks=networks, saved_networks=saved_networks,
+                                      message=f"No saved credentials found for {ssid}", message_type="error")
+    logger.info(f"Quick connecting to {ssid} using saved credentials...")
+    if connect_to_wifi(ssid, password):
+        if monitor.test_connection():
+            message = (f"Successfully connected to <b>{ssid}</b> using saved credentials! "
+                       f"Configuration portal will close shortly.")
+            message_type = "success"
+            monitor.has_internet = True
+            monitor.no_internet_start_time = None
+            # ---- NEW: clear redirect rules immediately after success ----
+            monitor.flush_iptables()
+
+            def shutdown_ap():
+                time.sleep(5)
+                if monitor.ap_active:
+                    monitor.stop_access_point()
+            threading.Thread(target=shutdown_ap, daemon=True).start()
+        else:
+            message = f"Connected to <b>{ssid}</b> but no internet access."
+            message_type = "error"
+    else:
+        message = f"Failed to connect to {ssid}. Saved credentials may be outdated."
+        message_type = "error"
+
+    return render_template_string(WIFI_SETUP_HTML, networks=networks, saved_networks=saved_networks,
+                                  message=message, message_type=message_type)
+
+# Captive portal detection routes
+@app.route("/generate_204"); @app.route("/gen_204")
+def android_captive_portal(): return redirect("/")
+
+@app.route("/hotspot-detect.html")
+def ios_captive_portal(): return redirect("/")
+
+@app.route("/connectivity-check.html"); @app.route("/connectivitycheck/android_204")
+def google_captive_portal(): return redirect("/")
+
+@app.route("/ncsi.txt")
+def windows_captive_portal(): return redirect("/")
+
+@app.route("/redirect")
+def generic_redirect(): return redirect("/")
+
+@app.route("/<path:path>")
+def catch_all(path): return redirect("/")
+
+# -------------- Main --------------
+def main():
+    global button_controller
+    if os.geteuid() != 0:
+        print("This script needs to be run as root (use sudo)")
+        print("Run: sudo python3 captive_portal.py")
+        sys.exit(1)
+
+    logger.info("Waiting for system initialization...")
+    time.sleep(3)
+    os.makedirs("/var/log", exist_ok=True)
+    os.makedirs("/etc/mypi", exist_ok=True)
+
+    logger.info("Starting Enhanced Auto-Captive Portal with GPIO Button Support...")
+    logger.info(f"Configuration: Internet check every {INTERNET_CHECK_INTERVAL}s, Portal activation after {NO_INTERNET_TIMEOUT}s")
+    logger.info(f"GPIO Button: Pin {BUTTON_PIN} (hold {BUTTON_HOLD_TIME}s to activate)")
+
+    button_controller = ButtonController(callback=monitor.handle_button_activation)
+
+    threading.Thread(target=monitor.monitor_connection, daemon=True).start()
+
+    if monitor.test_connection():
+        logger.info("Internet connection detected - monitoring mode active")
+        monitor.has_internet = True
+        # ---- Ensure no leftover rules on boot when already online ----
+        monitor.flush_iptables()
+    else:
+        logger.info(f"No internet connection - starting {NO_INTERNET_TIMEOUT}-second countdown")
+        monitor.has_internet = False
+        monitor.no_internet_start_time = time.time()
+
+    try:
+        logger.info("Waiting for access point activation...")
+        while not monitor.ap_active:
+            time.sleep(1)
+        logger.info("Starting captive portal web server...")
+        logger.info(f"Users can now connect to '{AP_SSID}' network (open, no password)")
+        app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        monitor.monitoring = False
+        if button_controller: button_controller.cleanup()
+        if monitor.ap_active: monitor.stop_access_point()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
